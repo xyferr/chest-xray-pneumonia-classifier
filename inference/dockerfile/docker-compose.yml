@@ -1,0 +1,93 @@
+# Docker Compose for Chest X-Ray Pneumonia Classifier
+# ====================================================
+# 
+# Usage:
+#   Development: docker-compose up app-dev
+#   Production:  docker-compose up app
+#
+# With GPU (NVIDIA):
+#   docker-compose --profile gpu up app-gpu
+
+version: '3.8'
+
+services:
+  # Production service (CPU)
+  app:
+    build:
+      context: ../..
+      dockerfile: inference/dockerfile/Dockerfile
+      target: production
+    image: chest-xray-classifier:latest
+    container_name: chest-xray-api
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=/app/model/best_model.pt
+      - MODEL_NAME=resnet50
+      - DEVICE=cpu
+      - PORT=8000
+    volumes:
+      # Mount the trained model
+      - ../../outputs/checkpoints:/app/model:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Development service with hot reload
+  app-dev:
+    build:
+      context: ../..
+      dockerfile: inference/dockerfile/Dockerfile
+      target: development
+    image: chest-xray-classifier:dev
+    container_name: chest-xray-api-dev
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=/app/model/best_model.pt
+      - MODEL_NAME=resnet50
+      - DEVICE=cpu
+      - PORT=8000
+    volumes:
+      # Mount source code for hot reload
+      - ../../src:/app/src:ro
+      - ../../inference/api:/app/inference/api:ro
+      - ../../outputs/checkpoints:/app/model:ro
+    restart: unless-stopped
+
+  # GPU-enabled service (requires NVIDIA Docker)
+  app-gpu:
+    build:
+      context: ../..
+      dockerfile: inference/dockerfile/Dockerfile
+      target: production
+    image: chest-xray-classifier:gpu
+    container_name: chest-xray-api-gpu
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=/app/model/best_model.pt
+      - MODEL_NAME=resnet50
+      - DEVICE=cuda
+      - PORT=8000
+    volumes:
+      - ../../outputs/checkpoints:/app/model:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - gpu
+    restart: unless-stopped
+
+# Networks
+networks:
+  default:
+    name: chest-xray-network
