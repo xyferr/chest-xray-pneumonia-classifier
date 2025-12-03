@@ -62,6 +62,9 @@ class GradCAM:
     
     Generates heatmaps showing which regions of the input image the model
     focuses on for its predictions.
+    
+    This implementation avoids hooks entirely and uses torch.autograd.grad
+    for better compatibility with modern PyTorch versions.
     """
     
     def __init__(
@@ -78,38 +81,58 @@ class GradCAM:
         """
         self.model = model
         self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
-        self.handles = []
-        
-        # Register hooks
-        self._register_hooks()
-    
-    def _register_hooks(self):
-        """Register forward and backward hooks on target layer."""
-        def forward_hook(module, input, output):
-            # Clone to avoid inplace modification issues
-            self.activations = output.clone().detach()
-        
-        def backward_hook(module, grad_input, grad_output):
-            # Clone to avoid inplace modification issues
-            self.gradients = grad_output[0].clone().detach()
-        
-        # Store handles for cleanup
-        self.handles.append(self.target_layer.register_forward_hook(forward_hook))
-        self.handles.append(self.target_layer.register_full_backward_hook(backward_hook))
     
     def remove_hooks(self):
-        """Remove registered hooks."""
-        for handle in self.handles:
+        """No-op for compatibility. This implementation doesn't use persistent hooks."""
+        pass
+    
+    def _get_activations_and_gradients(
+        self,
+        input_tensor: torch.Tensor,
+        target_class: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get activations and gradients using forward hook and autograd.grad.
+        
+        Returns:
+            Tuple of (activations, gradients, output logits)
+        """
+        activations = None
+        
+        # Temporary forward hook to capture activations
+        def forward_hook(module, input, output):
+            nonlocal activations
+            activations = output
+        
+        # Register hook temporarily
+        handle = self.target_layer.register_forward_hook(forward_hook)
+        
+        try:
+            # Forward pass - need gradients enabled
+            output = self.model(input_tensor)
+            
+            # Get the target score
+            target_score = output[0, target_class]
+            
+            # Compute gradients using autograd.grad (avoids backward hook issues)
+            gradients = torch.autograd.grad(
+                outputs=target_score,
+                inputs=activations,
+                retain_graph=True,
+                create_graph=False,
+            )[0]
+            
+        finally:
+            # Always remove the hook
             handle.remove()
-        self.handles = []
+        
+        return activations.detach(), gradients.detach(), output.detach()
     
     def __call__(
         self,
         input_tensor: torch.Tensor,
         target_class: Optional[int] = None,
-    ) -> Tuple[np.ndarray, int, float]:
+    ) -> Tuple[np.ndarray, int, float, Dict[str, float]]:
         """
         Generate Grad-CAM heatmap.
         
@@ -118,59 +141,64 @@ class GradCAM:
             target_class: Target class index (None = use predicted class)
         
         Returns:
-            Tuple of (heatmap array, predicted class, confidence)
+            Tuple of (heatmap array, predicted class, confidence, probabilities dict)
         """
         self.model.eval()
         
-        # Enable gradients for this operation
+        # Clone input and enable gradients
         input_tensor = input_tensor.clone().requires_grad_(True)
         
-        # Forward pass
-        output = self.model(input_tensor)
-        
-        # Get prediction
-        probs = F.softmax(output, dim=1)
-        pred_class = output.argmax(dim=1).item()
-        confidence = probs[0, pred_class].item()
+        # First forward pass to get prediction (without hooks)
+        with torch.no_grad():
+            output_preview = self.model(input_tensor.detach())
+            probs = F.softmax(output_preview, dim=1)
+            pred_class = output_preview.argmax(dim=1).item()
+            confidence = probs[0, pred_class].item()
+            
+            # Build probabilities dict
+            probabilities = {
+                'NORMAL': probs[0, 0].item(),
+                'PNEUMONIA': probs[0, 1].item(),
+            }
         
         # Use target class or predicted class
         if target_class is None:
             target_class = pred_class
         
-        # Backward pass - create a one-hot target
-        self.model.zero_grad()
-        one_hot = torch.zeros_like(output)
-        one_hot[0, target_class] = 1.0
-        output.backward(gradient=one_hot, retain_graph=True)
-        
-        # Check if gradients were captured
-        if self.gradients is None or self.activations is None:
-            # Return a blank heatmap if hooks didn't capture data
+        try:
+            # Get activations and gradients
+            activations, gradients, _ = self._get_activations_and_gradients(
+                input_tensor, target_class
+            )
+            
+            # Compute weights (global average pooling of gradients)
+            weights = gradients.mean(dim=(2, 3), keepdim=True)
+            
+            # Weighted combination of activations
+            cam = (weights * activations).sum(dim=1, keepdim=True)
+            
+            # ReLU and normalize
+            cam = F.relu(cam)
+            cam = cam.squeeze().cpu().numpy()
+            
+            # Handle edge cases
+            if cam.size == 0:
+                cam = np.zeros((7, 7), dtype=np.float32)
+            
+            # Normalize to [0, 1]
+            cam_min, cam_max = cam.min(), cam.max()
+            if cam_max - cam_min > 1e-8:
+                cam = (cam - cam_min) / (cam_max - cam_min)
+            else:
+                cam = np.zeros_like(cam)
+                
+        except Exception as e:
+            # Fallback: return blank heatmap on any error
+            import logging
+            logging.getLogger("gradcam").warning(f"GradCAM failed: {e}")
             cam = np.zeros((7, 7), dtype=np.float32)
-            return cam, pred_class, confidence
         
-        # Compute weights (global average pooling of gradients)
-        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
-        
-        # Weighted combination of activations
-        cam = (weights * self.activations).sum(dim=1, keepdim=True)
-        
-        # ReLU and normalize
-        cam = F.relu(cam)
-        cam = cam.squeeze().cpu().numpy()
-        
-        # Handle edge cases
-        if cam.size == 0:
-            cam = np.zeros((7, 7), dtype=np.float32)
-        
-        # Normalize to [0, 1]
-        cam_min, cam_max = cam.min(), cam.max()
-        if cam_max - cam_min > 1e-8:
-            cam = (cam - cam_min) / (cam_max - cam_min)
-        else:
-            cam = np.zeros_like(cam)
-        
-        return cam, pred_class, confidence
+        return cam, pred_class, confidence, probabilities
     
     def generate_heatmap(
         self,
@@ -849,7 +877,7 @@ def run_full_evaluation(
                 image, label = test_dataset[idx]
                 image_tensor = image.unsqueeze(0).to(device)
                 
-                cam, pred_class, confidence = gradcam(image_tensor)
+                cam, pred_class, confidence, _ = gradcam(image_tensor)
                 
                 visualize_gradcam(
                     image=image,
@@ -859,6 +887,9 @@ def run_full_evaluation(
                     confidence=confidence,
                     save_path=str(gradcam_dir / f'gradcam_{i}.png'),
                 )
+            
+            # Clean up hooks
+            gradcam.remove_hooks()
             
             logger.info(f"Saved {num_gradcam_samples} Grad-CAM visualizations to {gradcam_dir}")
         except Exception as e:

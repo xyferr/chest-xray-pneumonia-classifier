@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 import numpy as np
 from PIL import Image
 
@@ -43,9 +47,9 @@ from utils import get_device, get_logger, InferenceConfig
 # Configuration
 # =============================================================================
 
-# Model configuration - can be overridden by environment variables
+# Model configuration - loaded from .env file or environment variables
 MODEL_PATH = os.environ.get("MODEL_PATH", "outputs/checkpoints/best_model.pt")
-MODEL_NAME = os.environ.get("MODEL_NAME", "resnet50")
+MODEL_NAME = os.environ.get("MODEL_NAME", "baseline_cnn")
 DEVICE = os.environ.get("DEVICE", "auto")
 IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
 
@@ -150,7 +154,7 @@ class ModelManager:
             
             # Load weights
             if os.path.exists(model_path):
-                checkpoint = torch.load(model_path, map_location=self.device)
+                checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
                 
                 # Handle different checkpoint formats
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -277,16 +281,11 @@ class ModelManager:
         if self.gradcam is None:
             raise ValueError("Grad-CAM not initialized")
         
-        # Preprocess
+        # Preprocess - create a fresh copy for each prediction
         tensor = self.preprocess_image(image)
         
-        # Get Grad-CAM
-        cam, pred_idx, confidence = self.gradcam(tensor)
-        
-        # Get probabilities
-        with torch.no_grad():
-            output = self.model(tensor)
-            probs = F.softmax(output, dim=1)
+        # Get Grad-CAM - this now returns probabilities too
+        cam, pred_idx, confidence, probabilities = self.gradcam(tensor)
         
         # Create overlay image
         gradcam_image = self._create_gradcam_overlay(image, cam)
@@ -302,10 +301,7 @@ class ModelManager:
         return {
             "prediction": CLASS_NAMES[pred_idx],
             "confidence": confidence,
-            "probabilities": {
-                CLASS_NAMES[i]: probs[0, i].item() 
-                for i in range(len(CLASS_NAMES))
-            },
+            "probabilities": probabilities,
             "processing_time_ms": processing_time,
             "gradcam_image": img_base64,
         }
